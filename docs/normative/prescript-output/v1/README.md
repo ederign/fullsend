@@ -188,7 +188,9 @@ When running under GitHub Actions (`GITHUB_ACTIONS=true` **and** `GITHUB_OUTPUT`
 set), `fullsend run` appends the outputs to `$GITHUB_OUTPUT` on every path it
 reaches the skip decision on — skip, proceed, and harnesses that define no
 `pre_script` at all — with `skipped` normalized to `true`/`false`. The composite
-action re-exports them as the `skipped` and `skip-reason` action outputs.
+action re-exports them as the `skipped`, `disabled`, and `skip-reason` action outputs.
+For agents explicitly disabled in configuration (`enabled: false`), `fullsend run`
+relays `skipped=true` alongside `disabled=true` and the skip reason.
 
 A consumer can therefore distinguish three states:
 

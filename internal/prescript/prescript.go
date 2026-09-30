@@ -70,8 +70,9 @@ const EnvVar = "FULLSEND_PRESCRIPT_OUTPUT"
 const ExitCodeNeutral = 78
 
 const (
-	skippedKey = "skipped"
-	reasonKey  = "reason"
+	skippedKey  = "skipped"
+	reasonKey   = "reason"
+	disabledKey = "disabled"
 
 	// maxOutputSize caps the output file read, mirroring internal/envfile.
 	maxOutputSize = 1 << 20 // 1 MB
@@ -90,7 +91,7 @@ var heredocRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*<<`)
 // reservedKeys are the keys the protocol itself interprets. A key that
 // differs from one of these only by case is rejected rather than stored as
 // an unrelated output — see the package doc on silent-proceed failures.
-var reservedKeys = []string{skippedKey, reasonKey}
+var reservedKeys = []string{skippedKey, reasonKey, disabledKey}
 
 // Result is the parsed pre-script output.
 type Result struct {
@@ -257,6 +258,9 @@ func validateOutputs(outputs map[string]string) error {
 // skipped key is always written (normalized to "true"/"false") so
 // consumers can gate on its value, and an absent key means the CLI
 // predates this protocol rather than "not skipped".
+//
+// Any additional keys in res.Outputs are relayed alongside skipped, such as
+// "reason" and "disabled" ("true" when an agent is disabled in config).
 func Relay(res Result) (relayed bool, err error) {
 	target := os.Getenv("GITHUB_OUTPUT")
 	// Gate on GITHUB_ACTIONS as well as the file path, matching
