@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Wire contract of the GitHub bot-role lookup (ADR 0107). The client side
@@ -25,6 +26,31 @@ const (
 	// maxBotRoleBodyBytes bounds the request body and the GitHub /apps
 	// response body read by the lookup.
 	maxBotRoleBodyBytes = 64 << 10
+
+	// A transient GitHub failure (transport error, 5xx, rate limit) of the
+	// /apps or installation lookup is retried at most botRoleMaxAttempts
+	// times in all. Each wait honors Retry-After (or, for an exhausted
+	// primary quota, X-RateLimit-Reset) and falls back to a doubling
+	// backoff; a wait over botRoleMaxWait, or one the request deadline
+	// cannot cover, ends the retries with the failure instead.
+	botRoleMaxAttempts = 3
+	botRoleMaxWait     = 5 * time.Second
+	botRoleBackoffBase = 500 * time.Millisecond
+)
+
+var (
+	// botRoleNow and botRoleSleep are the retry clock, replaced in tests.
+	botRoleNow   = time.Now
+	botRoleSleep = func(ctx context.Context, d time.Duration) error {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-t.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 )
 
 // botLoginPattern matches a GitHub App bot login: the App slug followed by
@@ -139,7 +165,10 @@ func (h *Handler) resolveBotRole(ctx context.Context, actorLogin, owner, name st
 	// per-IP rate limit, which the mint's shared egress addresses exhaust.
 	// Authenticate it as one of the mint's own Apps when possible so it is
 	// counted against that App instead. A failure to do so, or a rejection of
-	// that credential by GitHub, only degrades to the anonymous call.
+	// that credential by GitHub (401, or a 403 that is not a rate limit), only
+	// degrades to the anonymous call. A rate limit never does: the
+	// anonymous quota is the scarcer one, so the lookup waits (bounded) and
+	// then fails.
 	var appsJWT, appsJWTRole string
 	if authRole := h.firstAllowedRole(); authRole != "" {
 		jwt, err := h.appJWT(ctx, authRole)
@@ -150,7 +179,15 @@ func (h *Handler) resolveBotRole(ctx context.Context, actorLogin, owner, name st
 		}
 	}
 
-	appID, err := h.lookupGitHubAppID(ctx, slug, appsJWT)
+	lookupAppID := func(jwt string) (id string, err error) {
+		err = retryGitHubLookup(ctx, "/apps lookup", func() (e error) {
+			id, e = h.lookupGitHubAppID(ctx, slug, jwt)
+			return e
+		})
+		return id, err
+	}
+
+	appID, err := lookupAppID(appsJWT)
 	if errors.Is(err, errAppsAuthRejected) {
 		// A parseable key that GitHub rejects (rotated, revoked, wrong App)
 		// must not gate every lookup. Retry anonymously and drop the
@@ -158,7 +195,7 @@ func (h *Handler) resolveBotRole(ctx context.Context, actorLogin, owner, name st
 		// role's own.
 		log.Printf("bot-role lookup: /apps lookup authenticated as role %q was rejected, using anonymous request: %v", appsJWTRole, err)
 		appsJWT, appsJWTRole = "", ""
-		appID, err = h.lookupGitHubAppID(ctx, slug, "")
+		appID, err = lookupAppID("")
 	}
 	if err != nil {
 		return "", err
@@ -177,7 +214,10 @@ func (h *Handler) resolveBotRole(ctx context.Context, actorLogin, owner, name st
 			return "", err
 		}
 	}
-	if _, err := FindInstallation(ctx, h.githubBaseURL, jwt, owner, name); err != nil {
+	if err := retryGitHubLookup(ctx, "installation lookup", func() error {
+		_, err := FindInstallation(ctx, h.githubBaseURL, jwt, owner, name)
+		return err
+	}); err != nil {
 		if errors.Is(err, ErrInstallationNotFound) {
 			return "", errBotRoleNoMatch
 		}
@@ -276,7 +316,7 @@ func (h *Handler) lookupGitHubAppID(ctx context.Context, slug, jwt string) (stri
 
 	resp, err := mintHTTP(req)
 	if err != nil {
-		return "", fmt.Errorf("getting app %q: %w", slug, err)
+		return "", &githubStatusError{msg: fmt.Sprintf("getting app %q: %v", slug, err), err: err}
 	}
 	defer resp.Body.Close()
 
@@ -285,11 +325,13 @@ func (h *Handler) lookupGitHubAppID(ctx context.Context, slug, jwt string) (stri
 		return "", errBotRoleNoMatch
 	}
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		if jwt != "" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-			return "", fmt.Errorf("getting app %q returned status %d: %w", slug, resp.StatusCode, errAppsAuthRejected)
+		statusErr := newGitHubStatusError(resp, fmt.Sprintf("getting app %q returned status %d", slug, resp.StatusCode))
+		// A 403 is rejected credentials only when it is not a rate limit.
+		if jwt != "" && !statusErr.RateLimited &&
+			(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return "", fmt.Errorf("%s: %w", statusErr.msg, errAppsAuthRejected)
 		}
-		return "", fmt.Errorf("getting app %q returned status %d", slug, resp.StatusCode)
+		return "", statusErr
 	}
 
 	var app githubAppResponse
@@ -300,6 +342,51 @@ func (h *Handler) lookupGitHubAppID(ctx context.Context, slug, jwt string) (stri
 		return "", fmt.Errorf("app %q response has no id", slug)
 	}
 	return strconv.FormatInt(*app.ID, 10), nil
+}
+
+// retryGitHubLookup runs call, repeating it after a bounded wait while it
+// fails with a transient githubStatusError (see the botRoleMaxAttempts
+// constants). Any other error, including errBotRoleNoMatch and
+// errAppsAuthRejected, is returned at once.
+func retryGitHubLookup(ctx context.Context, what string, call func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := call()
+		var statusErr *githubStatusError
+		if err == nil || !errors.As(err, &statusErr) || !statusErr.Transient() ||
+			ctx.Err() != nil || attempt >= botRoleMaxAttempts {
+			return err
+		}
+		wait, ok := statusErr.retryWait(botRoleNow(), attempt)
+		if deadline, has := ctx.Deadline(); ok && has && wait >= deadline.Sub(botRoleNow()) {
+			ok = false
+		}
+		if !ok {
+			log.Printf("bot-role lookup: %s failed and the wait it needs exceeds the retry bound, not retrying: %v", what, err)
+			return err
+		}
+		log.Printf("bot-role lookup: %s failed (attempt %d/%d), retrying in %s: %v", what, attempt, botRoleMaxAttempts, wait, err)
+		if sleepErr := botRoleSleep(ctx, wait); sleepErr != nil {
+			return err
+		}
+	}
+}
+
+// retryWait is how long to wait before repeating the failed call, and false
+// when that is longer than botRoleMaxWait. Retry-After wins; otherwise an
+// exhausted primary quota waits for its reset; otherwise the wait doubles
+// from botRoleBackoffBase.
+func (e *githubStatusError) retryWait(now time.Time, attempt int) (time.Duration, bool) {
+	var wait time.Duration
+	switch {
+	case e.RetryAfter > 0:
+		wait = e.RetryAfter
+	case e.RateLimited && e.Exhausted && !e.ResetAt.IsZero():
+		// The extra second covers clock skew against GitHub's reset time.
+		wait = max(e.ResetAt.Sub(now), 0) + time.Second
+	default:
+		wait = botRoleBackoffBase << (attempt - 1)
+	}
+	return wait, wait <= botRoleMaxWait
 }
 
 func writeBotRoleResponse(w http.ResponseWriter, resp botRoleResponse) {

@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // botRoleGitHub configures the fake GitHub API used by bot-role tests.
@@ -102,8 +106,88 @@ func newBotRoleEnv(t *testing.T, cfg botRoleGitHub, roles ...string) *testOIDCEn
 	}
 	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: pems})
 	env.handler.githubBaseURL = newBotRoleGitHub(t, cfg).URL
+	stubBotRoleClock(t, time.Now()) // retries must not really sleep
 	return env
 }
+
+// stubBotRoleClock replaces the retry clock with a fixed now and a sleep
+// that returns at once, and returns the waits requested so far.
+func stubBotRoleClock(t *testing.T, now time.Time) *[]time.Duration {
+	t.Helper()
+	var (
+		mu    sync.Mutex
+		waits []time.Duration
+	)
+	oldNow, oldSleep := botRoleNow, botRoleSleep
+	botRoleNow = func() time.Time { return now }
+	botRoleSleep = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		defer mu.Unlock()
+		waits = append(waits, d)
+		return nil
+	}
+	t.Cleanup(func() { botRoleNow, botRoleSleep = oldNow, oldSleep })
+	return &waits
+}
+
+// seqResponse is one scripted GitHub answer.
+type seqResponse struct {
+	status int
+	header map[string]string
+	body   string
+}
+
+// sequencedGitHub answers /apps/{slug} and /repos/{o}/{r}/installation from
+// scripted sequences (the last answer repeats) and counts the requests and
+// the Authorization header of each /apps request.
+type sequencedGitHub struct {
+	mu           sync.Mutex
+	apps         []seqResponse
+	installs     []seqResponse
+	appsCalls    int
+	installCalls int
+	appsAuth     []string
+}
+
+func newSequencedGitHub(t *testing.T, env *testOIDCEnv, apps, installs []seqResponse) *sequencedGitHub {
+	t.Helper()
+	g := &sequencedGitHub{apps: apps, installs: installs}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.mu.Lock()
+		var seq []seqResponse
+		var n int
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/apps/"):
+			g.appsAuth = append(g.appsAuth, r.Header.Get("Authorization"))
+			seq, n = g.apps, g.appsCalls
+			g.appsCalls++
+		case strings.HasSuffix(r.URL.Path, "/installation"):
+			seq, n = g.installs, g.installCalls
+			g.installCalls++
+		default:
+			g.mu.Unlock()
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		g.mu.Unlock()
+		resp := seq[min(n, len(seq)-1)]
+		for k, v := range resp.header {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(resp.status)
+		w.Write([]byte(resp.body))
+	}))
+	t.Cleanup(srv.Close)
+	env.handler.githubBaseURL = srv.URL
+	return g
+}
+
+var (
+	seqAppOK      = seqResponse{status: http.StatusOK, body: `{"id":300}`}
+	seqInstallOK  = seqResponse{status: http.StatusOK, body: `{"id":42,"account":{"login":"test-org"}}`}
+	seqBadGateway = seqResponse{status: http.StatusBadGateway}
+)
 
 func postBotRole(t *testing.T, env *testOIDCEnv, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -437,4 +521,217 @@ func TestBotRole_LookupGitHubAppIDBadURL(t *testing.T) {
 	if _, err := h.lookupGitHubAppID(context.Background(), "app", ""); err == nil {
 		t.Fatal("expected error for invalid base URL")
 	}
+}
+
+func TestBotRole_RetriesTransientAppsFailure(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	g := newSequencedGitHub(t, env,
+		[]seqResponse{seqBadGateway, seqBadGateway, seqAppOK}, []seqResponse{seqInstallOK})
+	waits := stubBotRoleClock(t, time.Now())
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+	if g.appsCalls != 3 {
+		t.Errorf("/apps calls = %d, want 3", g.appsCalls)
+	}
+	if want := []time.Duration{botRoleBackoffBase, 2 * botRoleBackoffBase}; !slicesEqual(*waits, want) {
+		t.Errorf("waits = %v, want %v", *waits, want)
+	}
+}
+
+func TestBotRole_RetriesTransientInstallationFailure(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	g := newSequencedGitHub(t, env,
+		[]seqResponse{seqAppOK}, []seqResponse{seqBadGateway, seqInstallOK})
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+	if g.installCalls != 2 {
+		t.Errorf("installation calls = %d, want 2", g.installCalls)
+	}
+}
+
+func TestBotRole_TransientFailureIsBounded(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	g := newSequencedGitHub(t, env, []seqResponse{seqBadGateway}, []seqResponse{seqInstallOK})
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleError(t, rec, http.StatusBadGateway, "bot-role lookup failed")
+	if g.appsCalls != botRoleMaxAttempts {
+		t.Errorf("/apps calls = %d, want %d", g.appsCalls, botRoleMaxAttempts)
+	}
+}
+
+func TestBotRole_RetriesTransportFailure(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			conn.Close()
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/apps/") {
+			w.Write([]byte(`{"id":300}`))
+			return
+		}
+		w.Write([]byte(`{"id":42,"account":{"login":"test-org"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	env.handler.githubBaseURL = srv.URL
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+}
+
+func TestBotRole_NoRetryForNoMatchOrCallerErrors(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	g := newSequencedGitHub(t, env,
+		[]seqResponse{{status: http.StatusNotFound}}, []seqResponse{seqInstallOK})
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeNoMatch, "")
+	if g.appsCalls != 1 {
+		t.Errorf("/apps calls = %d, want 1", g.appsCalls)
+	}
+}
+
+func TestBotRole_RateLimit403IsNotRejectedCredential(t *testing.T) {
+	// Authenticated /apps answers a rate-limit 403 once, with Retry-After.
+	// The lookup must wait and retry with the same App credential, never
+	// fall back to an anonymous request.
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review", "coder")
+	g := newSequencedGitHub(t, env, []seqResponse{
+		{status: http.StatusForbidden, header: map[string]string{"Retry-After": "2"}, body: `{"message":"You have exceeded a secondary rate limit"}`},
+		seqAppOK,
+	}, []seqResponse{seqInstallOK})
+	waits := stubBotRoleClock(t, time.Now())
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+	if want := []time.Duration{2 * time.Second}; !slicesEqual(*waits, want) {
+		t.Errorf("waits = %v, want %v", *waits, want)
+	}
+	if len(g.appsAuth) != 2 {
+		t.Fatalf("/apps calls = %d, want 2", len(g.appsAuth))
+	}
+	for i, a := range g.appsAuth {
+		if !strings.HasPrefix(a, "Bearer ") {
+			t.Errorf("/apps request %d Authorization = %q, want an App JWT (no anonymous fallback)", i, a)
+		}
+	}
+}
+
+func TestBotRole_PrimaryRateLimitWaitsForReset(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	reset := strconv.FormatInt(now.Add(3*time.Second).Unix(), 10)
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	newSequencedGitHub(t, env, []seqResponse{
+		{status: http.StatusForbidden, header: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset}, body: `{"message":"API rate limit exceeded"}`},
+		seqAppOK,
+	}, []seqResponse{seqInstallOK})
+	waits := stubBotRoleClock(t, now)
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+	if want := []time.Duration{4 * time.Second}; !slicesEqual(*waits, want) {
+		t.Errorf("waits = %v, want reset delay plus one second %v", *waits, want)
+	}
+}
+
+func TestBotRole_PrimaryRateLimitBeyondBoundFailsWithoutAnonymousFallback(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	reset := strconv.FormatInt(now.Add(10*time.Minute).Unix(), 10)
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review", "coder")
+	g := newSequencedGitHub(t, env, []seqResponse{
+		{status: http.StatusForbidden, header: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset}, body: `{"message":"API rate limit exceeded"}`},
+	}, []seqResponse{seqInstallOK})
+	waits := stubBotRoleClock(t, now)
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleError(t, rec, http.StatusBadGateway, "bot-role lookup failed")
+	if len(*waits) != 0 {
+		t.Errorf("waited %v for a reset beyond the retry bound", *waits)
+	}
+	if len(g.appsAuth) != 1 || g.appsAuth[0] == "" {
+		t.Errorf("/apps requests = %q, want one authenticated request and no anonymous fallback", g.appsAuth)
+	}
+}
+
+func TestBotRole_RateLimitWaitBoundedByRequestDeadline(t *testing.T) {
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review")
+	g := newSequencedGitHub(t, env, []seqResponse{
+		{status: http.StatusTooManyRequests, header: map[string]string{"Retry-After": "4"}},
+	}, []seqResponse{seqInstallOK})
+	waits := stubBotRoleClock(t, time.Now())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// botRoleNow is frozen at the real time, so the deadline is 2s away.
+	_, err := env.handler.resolveBotRole(ctx, "fullsend-review[bot]", "test-org", "test-repo")
+	if err == nil || errors.Is(err, errBotRoleNoMatch) {
+		t.Fatalf("err = %v, want a lookup failure", err)
+	}
+	if len(*waits) != 0 || g.appsCalls != 1 {
+		t.Errorf("waits = %v, /apps calls = %d; want no wait past the deadline and one call", *waits, g.appsCalls)
+	}
+}
+
+func TestBotRole_RejectedCredential403StillFallsBackAnonymously(t *testing.T) {
+	// A 403 that is not a rate limit is a rejected App credential.
+	env := newBotRoleEnv(t, botRoleGitHub{}, "review", "coder")
+	g := newSequencedGitHub(t, env, nil, []seqResponse{seqInstallOK})
+	g.apps = []seqResponse{{status: http.StatusForbidden, body: `{"message":"Bad credentials"}`}, seqAppOK}
+	rec := postBotRole(t, env, env.signToken(t, nil), botRoleBody)
+	assertBotRoleOK(t, rec, botRoleOutcomeRecognized, "review")
+	if len(g.appsAuth) != 2 || g.appsAuth[0] == "" || g.appsAuth[1] != "" {
+		t.Errorf("/apps Authorization = %q, want an App JWT then an anonymous retry", g.appsAuth)
+	}
+}
+
+func TestGitHubStatusError_Classification(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		header      map[string]string
+		body        string
+		rateLimited bool
+		transient   bool
+	}{
+		{"429", 429, nil, "", true, true},
+		{"403 retry-after", 403, map[string]string{"Retry-After": "7"}, "", true, true},
+		{"403 exhausted", 403, map[string]string{"X-RateLimit-Remaining": "0"}, "", true, true},
+		{"403 message", 403, nil, `{"message":"API rate limit exceeded"}`, true, true},
+		{"403 bad credentials", 403, map[string]string{"X-RateLimit-Remaining": "4000"}, `{"message":"Bad credentials"}`, false, false},
+		{"401", 401, nil, "", false, false},
+		{"500", 500, nil, "", false, true},
+		{"502", 502, nil, "", false, true},
+		{"503", 503, nil, "", false, true},
+		{"504", 504, nil, "", false, true},
+		{"422", 422, nil, "", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			for k, v := range tt.header {
+				h.Set(k, v)
+			}
+			resp := &http.Response{StatusCode: tt.status, Header: h, Body: io.NopCloser(strings.NewReader(tt.body))}
+			e := newGitHubStatusError(resp, "msg")
+			if e.RateLimited != tt.rateLimited || e.Transient() != tt.transient {
+				t.Errorf("RateLimited=%v Transient=%v, want %v %v", e.RateLimited, e.Transient(), tt.rateLimited, tt.transient)
+			}
+			if e.Error() != "msg" {
+				t.Errorf("Error() = %q", e.Error())
+			}
+		})
+	}
+}
+
+func slicesEqual(a, b []time.Duration) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
