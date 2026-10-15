@@ -143,6 +143,17 @@ func TestMintResolverLookupFailures(t *testing.T) {
 	}
 }
 
+func TestMintResolverLookupFailureKeepsRootCause(t *testing.T) {
+	m := &MintResolver{
+		MintURL:   "https://mint",
+		OIDCToken: func(context.Context) (string, error) { return "", context.DeadlineExceeded },
+	}
+	_, err := m.ResolveBotRole(context.Background(), BotRoleQuery{Forge: "github", Target: "o/r", Login: "app[bot]"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrLookup)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
 func TestMintResolverStalledServerFailsWithinBound(t *testing.T) {
 	orig := mintRequestTimeout
 	mintRequestTimeout = 100 * time.Millisecond

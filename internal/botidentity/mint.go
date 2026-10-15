@@ -129,7 +129,7 @@ func ParseMintBotRoleResponse(status int, body []byte) (BotRoleResult, error) {
 		return BotRoleResult{}, fmt.Errorf("%w: mint answered HTTP %d: %s", ErrLookup, status, msg)
 	}
 	if decodeErr != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: unreadable mint response: %v", ErrLookup, decodeErr)
+		return BotRoleResult{}, fmt.Errorf("%w: unreadable mint response: %w", ErrLookup, decodeErr)
 	}
 	switch resp.Outcome {
 	case MintOutcomeRecognized:
@@ -178,15 +178,15 @@ func (m *MintResolver) ResolveBotRole(ctx context.Context, q BotRoleQuery) (BotR
 	defer cancel()
 	token, err := m.OIDCToken(ctx)
 	if err != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: fetching OIDC token: %v", ErrLookup, err)
+		return BotRoleResult{}, fmt.Errorf("%w: fetching OIDC token: %w", ErrLookup, err)
 	}
 	body, err := json.Marshal(MintBotRoleRequest{ActorLogin: q.Login, Repo: q.Target})
 	if err != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: encoding request: %v", ErrLookup, err)
+		return BotRoleResult{}, fmt.Errorf("%w: encoding request: %w", ErrLookup, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(m.MintURL, "/")+MintBotRolePath, bytes.NewReader(body))
 	if err != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: building request: %v", ErrLookup, err)
+		return BotRoleResult{}, fmt.Errorf("%w: building request: %w", ErrLookup, err)
 	}
 	if !validMintURL(req.URL) {
 		return BotRoleResult{}, fmt.Errorf("%w: mint URL must use https", ErrLookup)
@@ -196,12 +196,12 @@ func (m *MintResolver) ResolveBotRole(ctx context.Context, q BotRoleQuery) (BotR
 
 	resp, err := mintClient(m.HTTPClient).Do(req)
 	if err != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: calling mint: %v", ErrLookup, err)
+		return BotRoleResult{}, fmt.Errorf("%w: calling mint: %w", ErrLookup, err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxMintResponseBytes))
 	if err != nil {
-		return BotRoleResult{}, fmt.Errorf("%w: reading mint response: %v", ErrLookup, err)
+		return BotRoleResult{}, fmt.Errorf("%w: reading mint response: %w", ErrLookup, err)
 	}
 	return ParseMintBotRoleResponse(resp.StatusCode, respBody)
 }
