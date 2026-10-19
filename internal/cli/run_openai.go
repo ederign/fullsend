@@ -90,16 +90,6 @@ var (
 	openAIDeleteRetries  = 20
 	openAIRefreshRetries = 3
 	openAIRefreshBackoff = 15 * time.Second
-	// openAIRefreshWatchdog is how often the refresher compares the wall
-	// clock with the refresh deadline (#7748). Short enough that a host
-	// that wakes only briefly (a macOS maintenance wake) still gets a check
-	// in each wake; Apple does not document how long those wakes last.
-	openAIRefreshWatchdog = 30 * time.Second
-	// openAIWallNowFn is the refresher's wall clock: time.Now with the
-	// monotonic reading stripped, so comparisons count time the host spent
-	// asleep, as the gateway's expiry does. Override in tests to return a
-	// clock that runs ahead of the real one, simulating a host that slept.
-	openAIWallNowFn = func() time.Time { return time.Now().Round(0) }
 )
 
 // openAIProviderHandle describes a run-scoped provider instance created by
@@ -1089,9 +1079,9 @@ func runOpenAIRefresh(ctx context.Context, h openAIProviderHandle, printer *ui.P
 		if openAIRefreshJitter > 0 {
 			jitter = time.Duration(rand.Int64N(int64(openAIRefreshJitter)))
 		}
-		now := openAIWallNowFn()
+		now := wallNowFn()
 		delay := openAIRefreshDelay(expiresAt, now, jitter)
-		if !waitOpenAIRefresh(ctx, delay, now.Add(delay)) {
+		if !waitWallClock(ctx, delay, now.Add(delay)) {
 			return
 		}
 
@@ -1109,7 +1099,7 @@ func runOpenAIRefresh(ctx context.Context, h openAIProviderHandle, printer *ui.P
 				// An attempt is bounded by what is left of the credential it is
 				// renewing — but an already-expired credential is exactly when a
 				// refresh is needed most (a suspended laptop), so keep a floor.
-				budget := expiresAt.Sub(openAIWallNowFn())
+				budget := expiresAt.Sub(wallNowFn())
 				if budget < time.Minute {
 					budget = time.Minute
 				}
@@ -1140,39 +1130,13 @@ func runOpenAIRefresh(ctx context.Context, h openAIProviderHandle, printer *ui.P
 			// ends. The recorded expiry still makes the gateway fail
 			// closed, so a persistent failure fails the run visibly.
 			printer.StepWarn(fmt.Sprintf("OpenAI credential refresh for %s failed %d attempts; retrying in %s (recorded expiry %s)", h.name, openAIRefreshRetries, openAIRefreshMinDelay, expiresAt.UTC().Format(time.RFC3339)))
-			now := openAIWallNowFn()
-			if !waitOpenAIRefresh(ctx, openAIRefreshMinDelay, now.Add(openAIRefreshMinDelay)) {
+			now := wallNowFn()
+			if !waitWallClock(ctx, openAIRefreshMinDelay, now.Add(openAIRefreshMinDelay)) {
 				return
 			}
 		}
 		expiresAt = next.Round(0)
-		printer.StepDone(fmt.Sprintf("OpenAI credential refreshed for %s (%s, next expiry in %s)", h.name, h.source, expiresAt.Sub(openAIWallNowFn()).Round(time.Minute)))
-	}
-}
-
-// waitOpenAIRefresh blocks until the next refresh is due — after delay, which
-// is dueAt on the wall clock — and reports false if ctx ends first. The timer
-// counts monotonic time, which does not advance while the host sleeps (macOS,
-// a suspended VM), so on its own it can fire after the gateway's wall-clock
-// expiry has already passed (#7748). A periodic wall-clock check releases the
-// wait as soon as dueAt has passed on the wall clock. On an awake host both
-// clocks advance together, so the check never fires ahead of the timer.
-func waitOpenAIRefresh(ctx context.Context, delay time.Duration, dueAt time.Time) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	watchdog := time.NewTicker(openAIRefreshWatchdog)
-	defer watchdog.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-			return true
-		case <-watchdog.C:
-			if !openAIWallNowFn().Before(dueAt) {
-				return true
-			}
-		}
+		printer.StepDone(fmt.Sprintf("OpenAI credential refreshed for %s (%s, next expiry in %s)", h.name, h.source, expiresAt.Sub(wallNowFn()).Round(time.Minute)))
 	}
 }
 
