@@ -8,6 +8,8 @@ Fullsend agents triage issues, implement solutions, review code, and merge to pr
 
 Visit **[fullsend.sh](https://fullsend.sh)** for the full documentation, including getting started guides, agent reference, architecture decisions, and design documents.
 
+The [Running agents locally guide](docs/guides/user/running-agents-locally.md) covers running agents locally with Fullsend.
+
 ## How to contribute
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow, vouch process, and commit conventions.
